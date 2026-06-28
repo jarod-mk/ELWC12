@@ -1,4 +1,4 @@
-const CACHE_NAME = "mk-wc-game-v41";
+const CACHE_NAME = "mk-wc-game-v53";
 const APP_SHELL = [
   "./",
   "./index.html",

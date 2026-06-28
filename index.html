@@ -305,6 +305,8 @@ const SUPABASE_URL = "https://pespqxjpwplltiginbjq.supabase.co";
 const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_GHgOcM5VerwipdHhXcoEGw_MF_lHOWf";
 const CLASSROOM_STORAGE_KEY = "mk_wc_classroom_id";
 const STUDENT_SESSION_KEY = "mk_wc_student_session_v1";
+const GAME_PROGRESS_STORAGE_KEY = "mk_wc_game_progress_v1";
+const STUDENT_HIDDEN_ASSIGNMENTS_KEY = "mk_wc_student_hidden_assignments_v1";
 const TEACHER_ADMIN_FUNCTION = "mk-classroom-admin";
 const STUDENT_API_FUNCTION = "mk-student-api";
 const VAPID_PUBLIC_KEY = "BCN-jkjE9qpmnjKyJzvFsoLZfrn2_qOOW-QPquAVDbHMQy42DhVv57bzBKD6w5GIQIU2CjAz8zCEPYfzaAQwG1s";
@@ -442,6 +444,7 @@ const KEEP_EXACT_WORDS = new Set([
   "someone","anyone","everyone","noone",
   "somebody","anybody","everybody","nobody",
   "somewhere","anywhere","everywhere","nowhere",
+  "sometimes",
   "others","species","offspring","promising","boring",
   "surrounding","surroundings",
   "willing","unwilling",
@@ -466,7 +469,7 @@ const FINAL_E_VERB_BASES = new Set([
 
 const MISSING_FINAL_E_FIXES = {
   achiev:"achieve", admir:"admire", agre:"agree", argu:"argue", arriv:"arrive",
-  assum:"assume", attun:"attune", attuned:"attune", bias:"bias", biase:"bias", biased:"bias",
+  assum:"assume", addd:"add", added:"add", adding:"add", attun:"attune", attuned:"attune", bias:"bias", biase:"bias", biased:"bias",
   believ:"believe", bor:"bore", bored:"bore", caus:"cause", chang:"change", clos:"close",
   compar:"compare", confus:"confuse", continu:"continue", creat:"create",
   decid:"decide", decreas:"decrease", describ:"describe", desir:"desire",
@@ -496,10 +499,31 @@ function cleanWordToken(word) {
     .replace(/[^a-z]/g,"");
 }
 
+function normalizeTeacherWordForm(word) {
+  return cleanWordToken(word);
+}
+
 function tokenizeEnglishWords(sentence) {
   return (String(sentence || "").match(/[A-Za-z]+(?:[’'][A-Za-z]+)?/g) || [])
     .map(s => s.trim())
     .filter(Boolean);
+}
+
+function tokenizeSentenceDisplayParts(sentence) {
+  const text = String(sentence || "");
+  const parts = [];
+  let wordIndex = 0;
+  const re = /[A-Za-z]+(?:[’'][A-Za-z]+)?|[^A-Za-z]+/g;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    const value = match[0];
+    if (/^[A-Za-z]+(?:[’'][A-Za-z]+)?$/.test(value)) {
+      parts.push({ type:"word", text:value, wordIndex:wordIndex++ });
+    } else {
+      parts.push({ type:"text", text:value });
+    }
+  }
+  return parts.length ? parts : [{ type:"text", text }];
 }
 
 function splitReadingSentences(lines) {
@@ -618,7 +642,7 @@ const POS_LABELS = {
   preposition:"전치사",
   conjunction:"접속사",
   pronoun:"대명사",
-  phrase:"표현",
+  phrase:"숙어",
   other:"기타"
 };
 
@@ -661,6 +685,11 @@ function makeSenseKey(word, pos) {
 function normalizeStoredVocabKey(word, data={}) {
   const raw = String(word || "").trim();
   if (!raw) return "";
+  if (data?.teacherEdited) {
+    const base = normalizeTeacherWordForm(baseWordFromKey(raw));
+    const p = normalizePosForBase(base, data.pos || data.part_of_speech || posFromKey(raw));
+    return base && p && !base.includes(" ") ? `${base}__${p}` : base;
+  }
   if (raw.includes("__")) {
     const [base, p] = raw.split("__");
     return makeSenseKey(base, normalizePosForBase(base, p || data.pos || data.part_of_speech));
@@ -671,11 +700,27 @@ function normalizeStoredVocabKey(word, data={}) {
 
 function displayVocabKey(key, data={}) {
   const base = baseWordFromKey(key);
-  const label = posLabel(data.pos || posFromKey(key));
+  const label = posLabel(data.pos || data.type || posFromKey(key));
   return label ? `${base} (${label})` : base;
 }
 
 const LOCAL_VOCAB_OVERRIDES = {
+  oxygen:{
+    ko:"산소",
+    syn:["O2","gas"],
+    ant:["carbon dioxide"],
+    pos:"noun",
+    base:"oxygen",
+    contextMeaning:"산소"
+  },
+  add:{
+    ko:"더하다, 추가하다, 보태다",
+    syn:["include","attach","insert","increase"],
+    ant:["remove","subtract","delete"],
+    pos:"verb",
+    base:"add",
+    contextMeaning:"추가하다"
+  },
   species:{
     ko:"종, 생물 종",
     syn:["kind","type","variety","group"],
@@ -740,6 +785,14 @@ const LOCAL_VOCAB_OVERRIDES = {
     base:"invite",
     contextMeaning:"초대하다"
   },
+  sometimes:{
+    ko:"때때로, 가끔",
+    syn:["occasionally","at times","now and then"],
+    ant:["always","never"],
+    pos:"adverb",
+    base:"sometimes",
+    contextMeaning:"때때로"
+  },
   "human being":{
     ko:"인간, 사람",
     syn:["person","human","individual"],
@@ -779,10 +832,22 @@ function dataMatchesSentence(data={}, sentence="") {
 }
 
 function findVocabEntry(source={}, key, sentence="") {
+  const directKey = String(key || "").trim();
+  if (directKey && source?.[directKey]) return [directKey, source[directKey]];
   const storedKey = normalizeStoredVocabKey(key);
   const base = baseWordFromKey(storedKey || key);
+  const raw = cleanWordToken(baseWordFromKey(key));
   const exactIsSense = String(storedKey || "").includes("__") || String(storedKey || "").includes(" ");
   if (exactIsSense && storedKey && source?.[storedKey]) return [storedKey, source[storedKey]];
+  const surfaceEntries = Object.entries(source || {}).filter(([,data]) => {
+    const surface = cleanWordToken(data?.surface);
+    const dataBase = cleanWordToken(data?.base);
+    return raw && (surface === raw || dataBase === raw);
+  });
+  const contextualSurface = surfaceEntries.filter(([,data]) => data?.context && dataMatchesSentence(data, sentence));
+  if (contextualSurface.length) return contextualSurface[0];
+  const surfaceMatches = surfaceEntries.filter(([,data]) => dataMatchesSentence(data, sentence));
+  if (surfaceMatches.length) return surfaceMatches[0];
   const baseEntries = Object.entries(source || {}).filter(([k]) => baseWordFromKey(k) === base);
   const contextual = baseEntries.filter(([,data]) => data?.context && dataMatchesSentence(data, sentence));
   if (contextual.length) return contextual[0];
@@ -808,10 +873,16 @@ function findSavedVocabEntry(source={}, key, data={}, sentence="") {
   }) || null;
 }
 
-function hasAnySavedVocabEntry(source={}, key) {
+function hasAnySavedVocabEntry(source={}, key, rawWord="") {
   const storedKey = normalizeStoredVocabKey(key);
   const base = baseWordFromKey(storedKey || key);
-  return !!base && Object.keys(source || {}).some(k => baseWordFromKey(k) === base);
+  const raw = cleanWordToken(rawWord || base);
+  return !!base && Object.entries(source || {}).some(([k,data]) => {
+    const savedBase = baseWordFromKey(k);
+    const dataBase = cleanWordToken(data?.base);
+    const surface = cleanWordToken(data?.surface);
+    return savedBase === base || dataBase === base || surface === base || (raw && (savedBase === raw || dataBase === raw || surface === raw));
+  });
 }
 
 function dataForVocabKey(unit, key, cache={}, sentence="") {
@@ -851,26 +922,105 @@ function keysForToken(unit, tokenKey, sentence="", cache={}) {
   return keys.length ? keys : [base];
 }
 
+function limitList(arr) {
+  return Array.isArray(arr) ? arr.map(v => String(v).trim()).filter(Boolean).slice(0,4) : [];
+}
+
+function splitKoreanMeaningText(text) {
+  return String(text || "")
+    .split(/[,;/·]| 또는 | 혹은 /)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+function looksLikeSentenceTranslation(text) {
+  const s = String(text || "").trim();
+  if (!s) return false;
+  const words = s.split(/\s+/).filter(Boolean);
+  const koreanVerbEnding = /(다|요|니다|한다|된다|했다|였다|시킨다|시켰다|전환시킨다)[.!?。！？]?$/;
+  if (words.length >= 5) return true;
+  if (words.length >= 3 && koreanVerbEnding.test(s)) return true;
+  if (words.length >= 3 && /[.!?。！？]$/.test(s)) return true;
+  return false;
+}
+
+function cleanKoreanMeaningCandidate(value, base="", context="") {
+  const s = String(value || "")
+    .replace(/^뜻\s*[:：]\s*/,"")
+    .replace(/^의미\s*[:：]\s*/,"")
+    .trim();
+  if (!s) return "";
+  if (looksLikeSentenceTranslation(s)) return "";
+  return s.replace(/[.!?。！？]+$/,"").trim();
+}
+
+function sanitizeKoreanMeaningList(values, base="", context="") {
+  const raw = Array.isArray(values) ? values : [values];
+  const cleaned = raw.flatMap(v => splitKoreanMeaningText(v))
+    .map(v => cleanKoreanMeaningCandidate(v, base, context))
+    .filter(Boolean);
+  return [...new Set(cleaned)].slice(0,4);
+}
+
 function normalizeVocabData(data={}) {
-  const limit = arr => Array.isArray(arr) ? arr.map(v => String(v).trim()).filter(Boolean).slice(0,4) : [];
-  const contextMeaning = String(data.contextMeaning || data.context_meaning || "").trim();
-  const meanings = limit(data.meanings || (data.ko ? [data.ko] : []));
-  const base = normalizeVocabKey(baseWordFromKey(data.base || data.word || ""));
+  const rawBase = baseWordFromKey(data.base || data.word || "");
+  const base = data.teacherEdited ? normalizeTeacherWordForm(rawBase) : normalizeVocabKey(rawBase);
+  const context = String(data.context || "").trim();
+  const contextMeaning = cleanKoreanMeaningCandidate(data.contextMeaning || data.context_meaning, base, context);
+  let meanings = sanitizeKoreanMeaningList(data.meanings || (data.ko ? splitKoreanMeaningText(data.ko) : []), base, context);
+  const fallback = LOCAL_VOCAB_OVERRIDES[base];
+  if (!contextMeaning && !meanings.length && fallback && fallback !== data) {
+    meanings = sanitizeKoreanMeaningList([fallback.contextMeaning, fallback.ko], base, "");
+  }
+  const displayContextMeaning = contextMeaning || cleanKoreanMeaningCandidate(fallback?.contextMeaning, base, "");
+  const koMeanings = displayContextMeaning
+    ? [displayContextMeaning, ...meanings.filter(m=>m !== displayContextMeaning)].slice(0,4)
+    : meanings.slice(0,4);
   const out = {
-    ko: data.ko || (contextMeaning ? [contextMeaning, ...meanings.filter(m=>m !== contextMeaning)].slice(0,4).join(", ") : meanings.join(", ")),
-    syn: limit(data.syn),
-    ant: limit(data.ant)
+    ko: koMeanings.join(", "),
+    syn: limitList(data.syn),
+    ant: limitList(data.ant)
   };
-  const pos = normalizePosForBase(base, data.pos || data.part_of_speech);
+  const pos = normalizePosForBase(base, data.pos || data.part_of_speech || (data.type === "phrase" ? "phrase" : ""));
   if (pos) out.pos = pos;
   if (base) out.base = base;
-  if (contextMeaning) out.contextMeaning = contextMeaning;
-  if (data.context) out.context = String(data.context).trim();
+  if (displayContextMeaning) out.contextMeaning = displayContextMeaning;
+  if (context) out.context = context;
   if (data.surface) out.surface = cleanWordToken(data.surface);
   if (data.type) out.type = String(data.type);
+  if (data.teacherEdited) out.teacherEdited = true;
   if (Array.isArray(data.parts)) out.parts = data.parts.map(v => String(v).trim()).filter(Boolean);
   if (data.note) out.note = String(data.note).trim();
   return out;
+}
+
+function phrasePartsFromEntry(key, data={}) {
+  const rawParts = Array.isArray(data?.parts) && data.parts.length
+    ? data.parts
+    : String(key || "").split(/\s+/);
+  return rawParts
+    .map(part => normalizeVocabKey(baseWordFromKey(part)))
+    .filter(Boolean);
+}
+
+function phraseAppearsInSentenceText(parts, sentence="") {
+  const phraseParts = [...new Set((parts || []).filter(Boolean))];
+  if (!phraseParts.length) return false;
+  const tokens = tokenizeEnglishWords(sentence);
+  const rawKeys = tokens.map(cleanWordToken);
+  const lookupKeys = tokens.map(w => normalizeWordForLookup(w));
+  if (phraseParts.length > tokens.length) return false;
+  for (let i=0;i<=tokens.length-phraseParts.length;i++) {
+    if (phraseParts.every((part,j) => rawKeys[i+j] === part || lookupKeys[i+j] === part)) return true;
+  }
+  return false;
+}
+
+function phraseEntriesForSentence(source={}, sentence="") {
+  return Object.entries(source || {}).filter(([key,data]) => {
+    if (!(data?.type === "phrase" || normalizePos(data?.pos) === "phrase" || String(key).includes(" "))) return false;
+    return phraseAppearsInSentenceText(phrasePartsFromEntry(key, data), sentence);
+  });
 }
 
 function firstMeaning(data={}) {
@@ -887,6 +1037,9 @@ function vocabEntriesForSentence(unit, sentence, cache={}) {
   tokens.forEach((w,i) => {
     const base = normalizeWordForLookup(w, unit.vocab, cache, { prev:tokens[i-1], next:tokens[i+1] });
     keysForToken(unit, base, sentence, cache).forEach(k => entries.push(k));
+  });
+  [unit?.vocab || {}, cache || {}, LOCAL_VOCAB_OVERRIDES || {}].forEach(source => {
+    phraseEntriesForSentence(source, sentence).forEach(([key]) => entries.push(key));
   });
   return entries.filter(k => {
     if (!k || seen.has(k)) return false;
@@ -920,16 +1073,21 @@ function normalizeVocabPayload(payload={}) {
 }
 
 function normalizeCandidateData(data={}, baseHint="") {
-  const limit = arr => Array.isArray(arr) ? arr.map(v => String(v).trim()).filter(Boolean).slice(0,4) : [];
-  const contextMeaning = String(data.contextMeaning || data.context_meaning || "").trim();
+  const base = normalizeVocabKey(baseWordFromKey(baseHint || data.base || data.word || ""));
+  const contextMeaning = cleanKoreanMeaningCandidate(data.contextMeaning || data.context_meaning, base, data.context);
   const out = {
-    meanings: limit(data.meanings || (data.ko ? [data.ko] : [])),
-    syn: limit(data.syn),
-    ant: limit(data.ant)
+    meanings: sanitizeKoreanMeaningList(data.meanings || (data.ko ? splitKoreanMeaningText(data.ko) : []), base, data.context),
+    syn: limitList(data.syn),
+    ant: limitList(data.ant)
   };
-  const pos = normalizePosForBase(baseHint || data.base || data.word, data.pos || data.part_of_speech);
+  const fallback = LOCAL_VOCAB_OVERRIDES[base];
+  if (!contextMeaning && !out.meanings.length && fallback) {
+    out.meanings = sanitizeKoreanMeaningList([fallback.contextMeaning, fallback.ko], base, "");
+  }
+  const pos = normalizePosForBase(base || baseHint || data.base || data.word, data.pos || data.part_of_speech || fallback?.pos);
   if (pos) out.pos = pos;
-  if (contextMeaning) out.contextMeaning = contextMeaning;
+  const displayContextMeaning = contextMeaning || cleanKoreanMeaningCandidate(fallback?.contextMeaning, base, "");
+  if (displayContextMeaning) out.contextMeaning = displayContextMeaning;
   return out;
 }
 
@@ -1067,6 +1225,74 @@ function readStudentSession() {
 function writeStudentSession(session) {
   if (!session) localStorage.removeItem(STUDENT_SESSION_KEY);
   else localStorage.setItem(STUDENT_SESSION_KEY, JSON.stringify(session));
+}
+
+function makeGameProgressKey(unit, assignment=null, studentSession=null) {
+  const owner = studentSession?.student?.id || studentSession?.student?.student_code || "local";
+  const target = assignment?.id ? `assignment:${assignment.id}` : `unit:${unit?.id || "unknown"}`;
+  return `${owner}:${target}`;
+}
+
+function readGameProgressStore() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(GAME_PROGRESS_STORAGE_KEY) || "{}");
+    return raw && typeof raw === "object" ? raw : {};
+  } catch(e) {
+    return {};
+  }
+}
+
+function readGameProgress(progressKey) {
+  if (!progressKey) return null;
+  const item = readGameProgressStore()[progressKey];
+  return item && typeof item === "object" ? item : null;
+}
+
+function writeGameProgress(progressKey, progress={}) {
+  if (!progressKey) return;
+  try {
+    const store = readGameProgressStore();
+    store[progressKey] = {
+      ...(store[progressKey] || {}),
+      ...progress,
+      updated_at:new Date().toISOString()
+    };
+    localStorage.setItem(GAME_PROGRESS_STORAGE_KEY, JSON.stringify(store));
+  } catch(e) {}
+}
+
+function clearGameProgress(progressKey) {
+  if (!progressKey) return;
+  try {
+    const store = readGameProgressStore();
+    delete store[progressKey];
+    localStorage.setItem(GAME_PROGRESS_STORAGE_KEY, JSON.stringify(store));
+  } catch(e) {}
+}
+
+function makeHiddenAssignmentOwnerKey(classroomId, student=null) {
+  const studentKey = student?.id || student?.student_code || "unknown";
+  return `${classroomId || "default"}:${studentKey}`;
+}
+
+function readHiddenAssignments(ownerKey) {
+  if (!ownerKey) return [];
+  try {
+    const store = JSON.parse(localStorage.getItem(STUDENT_HIDDEN_ASSIGNMENTS_KEY) || "{}");
+    const ids = store?.[ownerKey];
+    return Array.isArray(ids) ? ids.map(String) : [];
+  } catch(e) {
+    return [];
+  }
+}
+
+function writeHiddenAssignments(ownerKey, ids=[]) {
+  if (!ownerKey) return;
+  try {
+    const store = JSON.parse(localStorage.getItem(STUDENT_HIDDEN_ASSIGNMENTS_KEY) || "{}");
+    store[ownerKey] = [...new Set((ids || []).map(String).filter(Boolean))];
+    localStorage.setItem(STUDENT_HIDDEN_ASSIGNMENTS_KEY, JSON.stringify(store));
+  } catch(e) {}
 }
 
 function formatDateInputValue(date=new Date()) {
@@ -1562,7 +1788,8 @@ function App() {
   const saveGameVocab = (unitId, word, data, replaceWord="") => {
     if (studentOnly) return false;
     const key = normalizeStoredVocabKey(word, data || {});
-    const replaceKey = normalizeStoredVocabKey(replaceWord, data || {});
+    const replaceKey = String(replaceWord || "").trim();
+    const normalizedReplaceKey = normalizeStoredVocabKey(replaceWord, data || {});
     if (!key || !data) return false;
     const normalized = normalizeVocabData({
       ...data,
@@ -1573,7 +1800,9 @@ function App() {
     const nextUnits = updateUnits(prev => prev.map(u => {
       if (u.id !== unitId) return u;
       const nextVocab = { ...(u.vocab || {}) };
-      if (replaceKey && replaceKey !== key) delete nextVocab[replaceKey];
+      [replaceKey, normalizedReplaceKey].filter(Boolean).forEach(oldKey => {
+        if (oldKey !== key) delete nextVocab[oldKey];
+      });
       nextVocab[key] = normalized;
       savedUnit = {
         ...u,
@@ -3166,7 +3395,8 @@ function StudentMode({ units, selected, selectedAssignment, studentSession, onSt
     onBack={()=>{stop();onBack();}} onHome={()=>{stop();onHome();}} apiKey={apiKey} onChangeKey={onChangeKey}
     allowAiLookup={allowAiLookup} canSaveVocab={canSaveVocab} onSaveVocab={onSaveVocab}
     assignment={selectedAssignment} onStepProgress={recordStepProgress} onWordGameComplete={recordWordGame}
-    onAssignmentComplete={recordAssignmentResult}/>;
+    onAssignmentComplete={recordAssignmentResult}
+    progressKey={makeGameProgressKey(selected, selectedAssignment, studentSession)}/>;
 }
 
 function StudentPortal({ units, classroomId, session, onSession, onSelect }) {
@@ -3178,6 +3408,12 @@ function StudentPortal({ units, classroomId, session, onSession, onSelect }) {
   const [weekBase, setWeekBase] = useState(new Date());
   const [monthBase, setMonthBase] = useState(new Date());
   const [pushMsg, setPushMsg] = useState("");
+  const [hiddenDoneAssignmentIds, setHiddenDoneAssignmentIds] = useState([]);
+  const hiddenOwner = makeHiddenAssignmentOwnerKey(classroomId, dashboard?.student || session?.student);
+
+  useEffect(() => {
+    setHiddenDoneAssignmentIds(readHiddenAssignments(hiddenOwner));
+  }, [hiddenOwner]);
 
   const loadDashboard = async (token=session?.session_token) => {
     if (!token) return;
@@ -3278,6 +3514,8 @@ function StudentPortal({ units, classroomId, session, onSession, onSelect }) {
   const results = dashboard?.results || [];
   const stepProgress = dashboard?.step_progress || [];
   const resultByAssignment = Object.fromEntries(results.map(r=>[r.assignment_id, r]));
+  const visibleAssignments = assignments.filter(a => !(resultByAssignment[a.id] && hiddenDoneAssignmentIds.includes(String(a.id))));
+  const hiddenDoneCount = assignments.filter(a => resultByAssignment[a.id] && hiddenDoneAssignmentIds.includes(String(a.id))).length;
   const stepByAssignment = stepProgress.reduce((acc,s)=>{
     (acc[s.assignment_id] ||= {})[s.step_no] = s;
     return acc;
@@ -3293,6 +3531,18 @@ function StudentPortal({ units, classroomId, session, onSession, onSelect }) {
       return;
     }
     onSelect(unit, a);
+  };
+  const hideDoneAssignment = a => {
+    if (!resultByAssignment[a.id]) return;
+    const ok = window.confirm("완료한 과제를 학생 앱 목록에서 삭제할까요? 교사용 수행 기록과 성과 달력은 유지됩니다.");
+    if (!ok) return;
+    const next = [...new Set([...hiddenDoneAssignmentIds, String(a.id)])];
+    setHiddenDoneAssignmentIds(next);
+    writeHiddenAssignments(hiddenOwner, next);
+  };
+  const restoreHiddenAssignments = () => {
+    setHiddenDoneAssignmentIds([]);
+    writeHiddenAssignments(hiddenOwner, []);
   };
 
   return (
@@ -3325,12 +3575,22 @@ function StudentPortal({ units, classroomId, session, onSession, onSelect }) {
         <section style={lightPanelStyle()}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"12px", gap:"8px" }}>
             <h2 style={{ margin:0, fontSize:"18px", color:C.ink }}>오늘의 과제</h2>
-            <button onClick={()=>loadDashboard()} style={{ padding:"6px 10px", borderRadius:"8px", border:`1px solid ${C.border}`,
-              background:C.paper, color:C.muted, cursor:"pointer", fontSize:"12px", fontWeight:700 }}>{loading ? "동기화 중" : "새로고침"}</button>
+            <div style={{ display:"flex", gap:"6px", flexWrap:"wrap", justifyContent:"flex-end" }}>
+              {hiddenDoneCount > 0 && (
+                <button onClick={restoreHiddenAssignments} style={{ padding:"6px 10px", borderRadius:"8px", border:`1px solid ${C.border}`,
+                  background:C.paper, color:C.teal, cursor:"pointer", fontSize:"12px", fontWeight:800 }}>
+                  삭제한 완료 과제 복원
+                </button>
+              )}
+              <button onClick={()=>loadDashboard()} style={{ padding:"6px 10px", borderRadius:"8px", border:`1px solid ${C.border}`,
+                background:C.paper, color:C.muted, cursor:"pointer", fontSize:"12px", fontWeight:700 }}>{loading ? "동기화 중" : "새로고침"}</button>
+            </div>
           </div>
-          {!assignments.length ? <p style={{ color:C.muted, fontSize:"14px" }}>아직 배정된 과제가 없습니다.</p> : (
+          {!visibleAssignments.length ? <p style={{ color:C.muted, fontSize:"14px" }}>
+            {assignments.length ? "표시할 과제가 없습니다. 완료 과제를 삭제했다면 복원할 수 있습니다." : "아직 배정된 과제가 없습니다."}
+          </p> : (
             <div style={{ display:"grid", gap:"10px" }}>
-              {assignments.map(a=>{
+              {visibleAssignments.map(a=>{
                 const r = resultByAssignment[a.id];
                 const state = assignmentState(a, r);
                 return (
@@ -3353,8 +3613,17 @@ function StudentPortal({ units, classroomId, session, onSession, onSelect }) {
                           })}
                         </div>
                       </div>
-                      <button onClick={()=>openAssignment(a)} style={{ padding:"8px 12px", borderRadius:"10px", background:r?state.bg:C.teal,
-                        color:r?state.color:"#fff", border:"none", cursor:"pointer", fontWeight:800 }}>{r ? "다시 하기" : "시작"}</button>
+                      <div style={{ display:"flex", gap:"6px", flexWrap:"wrap", justifyContent:"flex-end" }}>
+                        <button onClick={()=>openAssignment(a)} style={{ padding:"8px 12px", borderRadius:"10px", background:r?state.bg:C.teal,
+                          color:r?state.color:"#fff", border:"none", cursor:"pointer", fontWeight:800 }}>{r ? "다시 하기" : "시작"}</button>
+                        {r && (
+                          <button onClick={()=>hideDoneAssignment(a)} style={{ padding:"8px 10px", borderRadius:"10px",
+                            background:C.paper, color:C.coral, border:`1px solid ${C.coral}55`, cursor:"pointer",
+                            fontWeight:800 }}>
+                            삭제
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 );
@@ -3469,12 +3738,12 @@ class StepErrorBoundary extends React.Component {
         border:`1px solid ${C.coral}55`, color:C.ink }}>
         <p style={{ margin:"0 0 6px", fontSize:"15px", fontWeight:800 }}>단계 화면을 불러오지 못했습니다.</p>
         <p style={{ margin:"0 0 12px", fontSize:"13px", color:C.muted }}>
-          앱을 새로고침하거나 이전 단계로 돌아간 뒤 다시 시도하세요.
+          저장된 진행 위치에서 현재 단계를 다시 열어 보세요.
         </p>
         <button onClick={this.props.onReset}
           style={{ padding:"8px 13px", borderRadius:"10px", border:"none",
             background:C.coral, color:"#fff", fontSize:"13px", fontWeight:800, cursor:"pointer" }}>
-          이전 단계로
+          현재 단계 다시 열기
         </button>
       </div>
     );
@@ -3482,15 +3751,41 @@ class StepErrorBoundary extends React.Component {
 }
 
 /* ════════════════════════════════════════ 게임 플레이어 ════════════════════════════════════════ */
-function GamePlayer({ unit, speak, speakAll, stop, onBack, onHome, apiKey, onChangeKey, allowAiLookup, canSaveVocab, onSaveVocab, assignment=null, onStepProgress=null, onWordGameComplete=null, onAssignmentComplete=null }) {
-  const [step, setStep] = useState(1);
-  const [stepDone, setStepDone] = useState({});
-  const [wordGameSummary, setWordGameSummary] = useState(null);
-  const startedAtRef = useRef(new Date().toISOString());
-  const go = s => { stop(); setStep(s); };
+function GamePlayer({ unit, speak, speakAll, stop, onBack, onHome, apiKey, onChangeKey, allowAiLookup, canSaveVocab, onSaveVocab, assignment=null, onStepProgress=null, onWordGameComplete=null, onAssignmentComplete=null, progressKey="" }) {
+  const [initialProgress] = useState(()=>readGameProgress(progressKey));
+  const initialStep = Math.min(4, Math.max(1, Number(initialProgress?.step) || 1));
+  const [step, setStep] = useState(initialStep);
+  const [stepDone, setStepDone] = useState(()=>initialProgress?.stepDone || {});
+  const [wordGameSummary, setWordGameSummary] = useState(()=>initialProgress?.wordGameSummary || null);
+  const [step4Progress, setStep4Progress] = useState(()=>initialProgress?.step4 || null);
+  const [retryKey, setRetryKey] = useState(0);
+  const startedAtRef = useRef(initialProgress?.startedAt || new Date().toISOString());
+  const persistProgress = (patch={}) => {
+    writeGameProgress(progressKey, {
+      unit_id:unit?.id || "",
+      assignment_id:assignment?.id || "",
+      startedAt:startedAtRef.current,
+      step,
+      stepDone,
+      wordGameSummary,
+      step4:step4Progress,
+      ...patch
+    });
+  };
+  const go = s => {
+    stop();
+    const nextStep = Math.min(4, Math.max(1, Number(s) || 1));
+    setStep(nextStep);
+    persistProgress({ step:nextStep });
+  };
   const requiresStepCompletion = !!assignment;
+  useEffect(() => {
+    persistProgress();
+  }, [progressKey, step, JSON.stringify(stepDone), JSON.stringify(wordGameSummary), JSON.stringify(step4Progress)]);
   const markStep = async (stepNo, payload={}) => {
-    setStepDone(prev=>({ ...prev, [stepNo]:true }));
+    const nextDone = { ...stepDone, [stepNo]:true };
+    setStepDone(nextDone);
+    persistProgress({ stepDone:nextDone });
     try {
       await onStepProgress?.({
         step_no:stepNo,
@@ -3505,9 +3800,25 @@ function GamePlayer({ unit, speak, speakAll, stop, onBack, onHome, apiKey, onCha
   };
   const finishWordGame = async (summary) => {
     setWordGameSummary(summary);
-    setStepDone(prev=>({ ...prev, 3:true }));
+    const nextDone = { ...stepDone, 3:true };
+    setStepDone(nextDone);
+    persistProgress({ stepDone:nextDone, wordGameSummary:summary });
     try { await onWordGameComplete?.(summary); }
     catch(e) { console.warn("word game save failed", e); }
+  };
+  const restartGame = () => {
+    clearGameProgress(progressKey);
+    startedAtRef.current = new Date().toISOString();
+    setStepDone({});
+    setWordGameSummary(null);
+    setStep4Progress(null);
+    stop();
+    setStep(1);
+    persistProgress({ step:1, stepDone:{}, wordGameSummary:null, step4:null, startedAt:startedAtRef.current });
+  };
+  const completeAssignment = async (payload) => {
+    await onAssignmentComplete?.(payload);
+    clearGameProgress(progressKey);
   };
   const steps = [
     {n:1,label:"한글 듣기",icon:"Headphones"},
@@ -3537,7 +3848,13 @@ function GamePlayer({ unit, speak, speakAll, stop, onBack, onHome, apiKey, onCha
       </div>
       <div style={{ maxWidth:"600px", margin:"0 auto", padding:"16px" }}>
         <div style={{ borderRadius:"20px", padding:"20px", background:C.paper, border:`1px solid ${C.border}` }}>
-          <StepErrorBoundary resetKey={step} onReset={()=>go(Math.max(1, step-1))}>
+          {initialProgress && (
+            <p style={{ margin:"0 0 12px", padding:"8px 10px", borderRadius:"10px",
+              background:C.tealLight, color:C.teal, fontSize:"12px", fontWeight:800 }}>
+              저장된 위치에서 이어하는 중입니다.
+            </p>
+          )}
+          <StepErrorBoundary resetKey={`${step}:${retryKey}`} onReset={()=>setRetryKey(k=>k+1)}>
             {step===1 && <GameStep1 unit={unit} speakAll={speakAll} stop={stop} onComplete={(payload)=>markStep(1,payload)}
               requireComplete={requiresStepCompletion} completed={!!stepDone[1]} onNext={()=>go(2)}/>}
             {step===2 && <GameStep2 unit={unit} speakAll={speakAll} stop={stop} onComplete={(payload)=>markStep(2,payload)}
@@ -3546,9 +3863,12 @@ function GamePlayer({ unit, speak, speakAll, stop, onBack, onHome, apiKey, onCha
               apiKey={apiKey} onChangeKey={onChangeKey} allowAiLookup={allowAiLookup}
               canSaveVocab={canSaveVocab} onSaveVocab={onSaveVocab} requireCardGame={requiresStepCompletion}
               onWordGameComplete={finishWordGame}/>}
-            {step===4 && <GameStep4 unit={unit} speak={speak} onPrev={()=>go(3)} onRestart={()=>go(1)}
+            {step===4 && <GameStep4 unit={unit} speak={speak} onPrev={()=>go(3)}
               assignment={assignment} startedAt={startedAtRef.current} wordGameSummary={wordGameSummary}
-              onAssignmentComplete={onAssignmentComplete}/>}
+              initialState={step4Progress}
+              onProgressChange={state=>setStep4Progress(state)}
+              onRestart={restartGame}
+              onAssignmentComplete={completeAssignment}/>}
           </StepErrorBoundary>
         </div>
       </div>
@@ -3664,6 +3984,23 @@ function GameStep2({ unit, speakAll, stop, onComplete, requireComplete=false, co
     setMsg("영어듣기 완료");
     await onComplete?.({ started_at:started, total_items:unit.englishSentences.length, correct_items:unit.englishSentences.length, raw:{ lines:unit.englishSentences.length } });
   };
+  const goNext = async () => {
+    stop();
+    setPlaying(false);
+    setActive(-1);
+    if (requireComplete && !done) {
+      const now = new Date().toISOString();
+      setDone(true);
+      setMsg("영어듣기 건너뜀");
+      await onComplete?.({
+        started_at:now,
+        total_items:unit.englishSentences.length,
+        correct_items:0,
+        raw:{ lines:unit.englishSentences.length, skipped:true }
+      });
+    }
+    onNext();
+  };
   return (
     <div>
       <SecTitle icon="Headphones" sub="STEP 2">영어 지문 전체 듣기</SecTitle>
@@ -3677,9 +4014,9 @@ function GameStep2({ unit, speakAll, stop, onComplete, requireComplete=false, co
       <div style={{ display:"flex", gap:"8px", flexWrap:"wrap" }}>
         <Btn primary onClick={playAll} disabled={playing}><Icon name="Volume2" size={15} color="#fff"/>{playing?"재생 중...":"듣기"}</Btn>
         <Btn onClick={()=>{stop();onPrev();}}>이전</Btn>
-        <Btn ghost disabled={requireComplete && !done} onClick={()=>{stop();onNext();}}>넘어가기 <Icon name="ArrowRight" size={15} color={C.coral}/></Btn>
+        <Btn ghost onClick={goNext}>넘어가기 <Icon name="ArrowRight" size={15} color={C.coral}/></Btn>
       </div>
-      {requireComplete && !done && <p style={{ margin:"10px 0 0", fontSize:"12px", color:C.coral }}>끝까지 들으면 다음 단계로 넘어갈 수 있습니다.</p>}
+      {requireComplete && !done && <p style={{ margin:"10px 0 0", fontSize:"12px", color:C.muted }}>끝까지 듣거나 바로 다음 단계로 넘어갈 수 있습니다.</p>}
       {msg && <p style={{ margin:"10px 0 0", fontSize:"12px", color:done?C.teal:C.coral, fontWeight:700 }}>{msg}</p>}
     </div>
   );
@@ -3691,6 +4028,7 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
   const [pool, setPool] = useState([]);
   const [sel, setSel]   = useState(null);
   const [wordEdit, setWordEdit] = useState("");
+  const [wordReplaceKey, setWordReplaceKey] = useState("");
   const [vocabDraft, setVocabDraft] = useState({ contextMeaning:"", ko:"", syn:"", ant:"", pos:"" });
   const [cache, setCache] = useState(()=>readWordCache());     // AI로 즉석 생성한 단어 데이터 캐시
   const [loading, setLoading] = useState(false);
@@ -3711,9 +4049,11 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
   const [wordAttempts, setWordAttempts] = useState([]);
   const [tapRecords, setTapRecords] = useState([]);
   const [wordGameSaved, setWordGameSaved] = useState(false);
+  const [wordGamePhase, setWordGamePhase] = useState(() => (requireCardGame && !teacherSetupMode ? "study" : "quiz"));
 
   const sent = unit.englishSentences[si]||"";
   const tokens = tokenizeEnglishWords(sent);
+  const sentenceParts = tokenizeSentenceDisplayParts(sent);
   const lookupKey = (w,i) => normalizeWordForLookup(w, unit.vocab, cache, { prev:tokens[i-1], next:tokens[i+1] });
   const rawTokenKeys = tokens.map(cleanWordToken);
   const tokenKeys = tokens.map((w,i)=>lookupKey(w,i));
@@ -3742,20 +4082,11 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
       pos:normalizePosForBase(sel, d.pos || posFromKey(sel)) || ""
     });
   }, [sel, d?.ko, d?.contextMeaning, d?.pos, JSON.stringify(d?.syn || []), JSON.stringify(d?.ant || [])]);
-  const partsForPhrase = (key, data) => Array.isArray(data?.parts) && data.parts.length
-    ? data.parts.map(part => normalizeVocabKey(baseWordFromKey(part))).filter(Boolean)
-    : String(key || "").split(/\s+/).map(part => normalizeVocabKey(baseWordFromKey(part))).filter(Boolean);
-  const phraseAppearsInSentence = parts => {
-    if (!parts.length || parts.length > tokenKeys.length) return false;
-    for (let i=0;i<=tokenKeys.length-parts.length;i++) {
-      if (parts.every((p,j)=>tokenKeys[i+j] === p || rawTokenKeys[i+j] === p)) return true;
-    }
-    return false;
-  };
-  const localPhraseEntries = Object.entries(LOCAL_VOCAB_OVERRIDES || {})
-    .filter(([key,data]) => data?.type === "phrase" || key.includes(" "));
+  const partsForPhrase = (key, data) => phrasePartsFromEntry(key, data);
+  const phraseAppearsInSentence = parts => phraseAppearsInSentenceText(parts, sent);
+  const localPhraseEntries = phraseEntriesForSentence(LOCAL_VOCAB_OVERRIDES || {}, sent);
   const relatedPhrasesForWord = (k, rawWord="") => [...Object.entries(unit.vocab || {}), ...localPhraseEntries]
-    .filter(([key,data]) => data?.type === "phrase" || key.includes(" "))
+    .filter(([key,data]) => data?.type === "phrase" || normalizePos(data?.pos) === "phrase" || key.includes(" "))
     .filter(([key,data]) => {
       const parts = partsForPhrase(key,data);
       const base = baseWordFromKey(k);
@@ -3765,10 +4096,23 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
     .map(([key])=>key);
   const orderPhraseParts = parts => [...new Set(parts)]
     .sort((a,b)=>(tokenOrder[a] ?? 999) - (tokenOrder[b] ?? 999));
+  const phrasePartsInSentenceOrder = parts => {
+    const selected = [...new Set((parts || []).map(part => normalizeVocabKey(baseWordFromKey(part))).filter(Boolean))];
+    if (!selected.length) return [];
+    if (selected.length <= tokenKeys.length) {
+      for (let i=0;i<=tokenKeys.length-selected.length;i++) {
+        const windowParts = selected.map((_,j) => normalizeVocabKey(rawTokenKeys[i+j] || tokenKeys[i+j]));
+        const sameSet = selected.every(part => windowParts.includes(part)) && windowParts.every(part => selected.includes(part));
+        if (sameSet) return windowParts;
+      }
+    }
+    return orderPhraseParts(selected);
+  };
   const parseList = text => String(text || "").split(",").map(s=>s.trim()).filter(Boolean).slice(0,4);
+  const needsCardGame = requireCardGame && !teacherSetupMode;
   const buildSentenceCards = () => {
-    const tapped = pool.filter(k => !String(k).includes(" ") && firstMeaning(getData(k)));
-    const difficult = vocabEntriesForSentence(unit, sent, cache).filter(k => !String(k).includes(" "));
+    const tapped = pool.filter(k => firstMeaning(getData(k)));
+    const difficult = vocabEntriesForSentence(unit, sent, cache);
     const keys = [...new Set([...tapped, ...difficult])].slice(0,4);
     return keys.map((word, idx) => ({
       word,
@@ -3781,10 +4125,16 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
     setCardIndex(0);
     setCardFeedback(null);
   };
+  const startCardGame = () => {
+    setCardQueue(buildSentenceCards());
+    resetCardRound();
+    setSavedNotice("");
+    setWordGamePhase("quiz");
+  };
   useEffect(() => {
-    if (teacherSetupMode || !requireCardGame) return;
+    if (!needsCardGame || wordGamePhase !== "quiz") return;
     if (cardIndex === 0 && !cardFeedback) setCardQueue(buildSentenceCards());
-  }, [si, pool.join("|"), Object.keys(cache).length, requireCardGame, teacherSetupMode]);
+  }, [si, pool.join("|"), Object.keys(cache).length, needsCardGame, wordGamePhase]);
 
   const resetPhraseDraft = () => {
     setPhraseParts([]);
@@ -3799,7 +4149,7 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
     const partKey = normalizeVocabKey(baseWordFromKey(k));
     setSavedNotice("");
     setPhraseParts(prev => {
-      const next = prev.includes(partKey) ? prev.filter(x=>x!==partKey) : orderPhraseParts([...prev, partKey]);
+      const next = prev.includes(partKey) ? prev.filter(x=>x!==partKey) : phrasePartsInSentenceOrder([...prev, partKey]);
       setPhraseText(next.join(" "));
       return next;
     });
@@ -3817,7 +4167,7 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
     if (!sel || !d) return;
     setPhraseMode(true);
     const parts = Array.isArray(d.parts) && d.parts.length ? d.parts : sel.split(/\s+/).filter(Boolean);
-    setPhraseParts(orderPhraseParts(parts));
+    setPhraseParts(phrasePartsInSentenceOrder(parts));
     setPhraseText(sel);
     setPhraseKo(d.ko || "");
     setPhraseSyn((d.syn || []).filter(Boolean).join(", "));
@@ -3827,7 +4177,8 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
     setSavedNotice("");
   };
   const recommendPhrase = async () => {
-    const expr = normalizeVocabKey(phraseText);
+    const orderedParts = phrasePartsInSentenceOrder(phraseParts.length ? phraseParts : String(phraseText || "").split(/\s+/));
+    const expr = normalizeVocabKey(orderedParts.length ? orderedParts.join(" ") : phraseText);
     if (!expr) { alert("먼저 표현을 입력하세요."); return; }
     const keyToUse = apiKey || askForGeminiKey(apiKey,onChangeKey);
     if (!keyToUse) return;
@@ -3857,7 +4208,8 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
     }
   };
   const savePhrase = () => {
-    const key = normalizeVocabKey(phraseText);
+    const orderedParts = phrasePartsInSentenceOrder(phraseParts.length ? phraseParts : String(phraseText || "").split(/\s+/));
+    const key = normalizeVocabKey((orderedParts.length ? orderedParts.join(" ") : phraseText));
     const ko = phraseKo.trim();
     if (phraseParts.length < 2) { alert("표현으로 묶을 단어를 2개 이상 선택하세요."); return; }
     if (!key) { alert("표현을 입력하세요."); return; }
@@ -3868,7 +4220,8 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
       syn: parseList(phraseSyn),
       ant: parseList(phraseAnt),
       type:"phrase",
-      parts:phraseParts,
+      pos:"phrase",
+      parts:orderedParts,
       note:phraseNote.trim()
     }, editingPhraseKey);
     if (ok) {
@@ -3922,9 +4275,13 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
 - word는 "${key}"가 동사면 동사원형, 명사면 단수형으로 쓴다.
 - pos는 이 문장 속 품사를 noun, verb, adjective, adverb, preposition, conjunction, pronoun, other 중 하나로 쓴다.
 - context_meaning은 이 문장에서 바로 적용되는 한글 뜻 1개를 쓴다.
+- context_meaning과 meanings는 반드시 선택한 단어/표현의 짧은 한글 뜻만 쓴다. 문장 전체 해석, 절/구 번역, 설명문을 쓰지 않는다.
+- 각 meanings 항목은 보통 1-4어절의 단어 뜻이어야 하며 마침표로 끝나는 문장으로 쓰지 않는다.
+- 예: oxygen은 "산소"라고 쓰고 "광합성 과정을 통해 이산화탄소를 산소로 전환시킨다"처럼 문장으로 설명하지 않는다.
 - respect처럼 명사와 동사가 모두 가능한 단어는 문장 구조를 보고 품사를 판단한다.
 - 대명사, 부사, 전치사, 접속사, 고유한 한 단어는 억지로 줄이지 말고 원래 단어를 그대로 쓴다.
-- "${key}"가 others, species, offspring, rose, roses, promising, boring, bore, frustrate, frsturate, frusturate, invite, invit, human being, well being, surrounding, surroundings, willing처럼 대명사/명사/형용사/동사/표현 역할이면 other, specie, offspr, rise, promise, bor, frustrat, invit, be, surround, will로 바꾸지 말고 문맥에 맞는 표제어를 word에 쓴다.
+- "${key}"가 added, adding, others, species, offspring, rose, roses, promising, boring, bore, frustrate, frsturate, frusturate, invite, invit, sometimes, human being, well being, surrounding, surroundings, willing처럼 동사/대명사/명사/형용사/부사/표현 역할이면 ad, other, specie, offspr, rise, promise, bor, frustrat, invit, sometime, be, surround, will로 바꾸지 말고 문맥에 맞는 표제어를 word에 쓴다.
+- 특히 added/adding이 "더하다", "추가하다" 뜻의 add 변화형이면 word는 add로 쓰고 절대 ad로 줄이지 않는다.
 - 특히 others는 "다른 사람들", "다른 것들", "나머지 사람들/것들" 뜻을 문맥에 맞게 우선한다.
 - 특히 species는 단수형과 복수형이 같은 명사이며, "종", "생물 종" 뜻을 문맥에 맞게 우선하고 절대 specie로 바꾸지 않는다.
 - 특히 offspring은 단수형과 복수형이 같은 명사이며, "자손", "새끼", "후손" 뜻을 문맥에 맞게 우선하고 절대 offspr로 줄이지 않는다.
@@ -3935,11 +4292,13 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
 - 특히 frustrate가 "좌절시키다", "짜증나게 하다", "방해하다" 뜻의 동사이면 pos는 verb로 쓰고 frustrat로 줄이지 않는다.
 - 특히 frsturate/frusturate는 철자 오류이면 word를 frustrate로 고치고 pos는 verb로 쓴다.
 - 특히 invit는 잘못 잘린 동사 원형이면 word를 invite로 고치고 pos는 verb로 쓴다.
+- 특히 sometimes는 "때때로", "가끔" 뜻의 부사이면 word를 sometimes로 쓰고 sometime으로 줄이지 않는다.
 - 특히 human being은 두 단어 표현이며 "인간", "사람" 뜻으로 쓰고 human 또는 be 하나로 줄이지 않는다.
 - 특히 well being은 두 단어 표현이며 "행복", "안녕", "건강한 상태" 뜻으로 쓰고 well 또는 be 하나로 줄이지 않는다.
 - 특히 surrounding은 "주변의", "둘러싼" 뜻을, surroundings는 "주변 환경", "주위", "주변 상황" 뜻을 문맥에 맞게 우선한다.
 - 특히 willing은 "기꺼이 ~하는", "자발적인", "~할 의향이 있는" 뜻을 문맥에 맞게 우선한다.
 - meanings는 가능한 한글 뜻을 자연스러운 한국어로 최대 4개까지 나열한다.
+- meanings에는 단어 뜻만 넣고 문장 전체 번역이나 긴 설명은 절대 넣지 않는다.
 - 한국 학생 중2-고3 수준에서 이해 가능한 쉬운 영어 유의어와 반의어를 우선한다.
 - 사람들이 실제로 많이 쓰는 순서대로 나열한다.
 - 유의어와 반의어는 가능한 경우 최대 4개까지, 없으면 있는 수만 배열한다.
@@ -4002,6 +4361,7 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
 
   const selPool = async (k) => {
     setSel(k);
+    setWordReplaceKey("");
     setSavedNotice("");
     speak(baseWordFromKey(k),"en-US");
     // 사전에도 없고 캐시에도 없으면 AI 생성
@@ -4016,28 +4376,35 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
   };
 
   const currentCard = cardQueue[cardIndex] || null;
-  const needsCardGame = requireCardGame && !teacherSetupMode;
   const sentenceCardDone = !needsCardGame || !cardQueue.length || (cardFeedback && cardIndex >= cardQueue.length - 1);
-  const finishWordGameIfNeeded = async () => {
+  const finishWordGameIfNeeded = async (options={}) => {
     if (!needsCardGame || wordGameSaved) return;
+    const skipped = !!options.skipped;
     const total = wordAttempts.length;
     const correct = wordAttempts.filter(a=>a.is_correct).length;
     const score = total ? Math.round((correct/total)*100) : 0;
     const summary = {
       attempts:wordAttempts,
       tapped_words:tapRecords,
-      score,
+      score:skipped ? null : score,
       total_items:total,
       correct_items:correct,
       raw:{
         sentence_count:unit.englishSentences.length,
         tapped_count:tapRecords.length,
-        attempts_count:total
+        attempts_count:total,
+        skipped
       }
     };
+    if (skipped) summary.skipped = true;
     setWordGameSaved(true);
     try { await onWordGameComplete?.(summary); }
     catch(e) { console.warn("word game save failed", e); }
+  };
+  const skipToReading = async () => {
+    if (teacherSetupMode) return;
+    await finishWordGameIfNeeded({ skipped:true });
+    onNext();
   };
   const chooseMeaning = async (choice) => {
     if (!currentCard || cardFeedback) return;
@@ -4069,6 +4436,10 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
     }
   };
   const next = async () => {
+    if (needsCardGame && wordGamePhase !== "quiz") {
+      alert("문장과 단어를 먼저 확인한 뒤 단어 카드 게임을 시작하세요.");
+      return;
+    }
     if (needsCardGame && !sentenceCardDone) {
       alert("이 문장의 단어 카드 게임을 먼저 끝내세요.");
       return;
@@ -4077,10 +4448,12 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
       setSi(si+1);
       setPool([]);
       setSel(null);
+      setWordReplaceKey("");
       setPhraseMode(false);
       resetPhraseDraft();
       setCardQueue([]);
       resetCardRound();
+      setWordGamePhase(needsCardGame ? "study" : "quiz");
     } else {
       await finishWordGameIfNeeded();
       onNext();
@@ -4091,16 +4464,18 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
     setSi(si-1);
     setPool([]);
     setSel(null);
+    setWordReplaceKey("");
     setPhraseMode(false);
     resetPhraseDraft();
     setCardQueue([]);
     resetCardRound();
+    setWordGamePhase(needsCardGame ? "study" : "quiz");
   };
 
   const selectedTeacherKey = sel ? findSavedVocabEntry(unit.vocab || {}, sel, d || {}, sent)?.[0] : "";
   const selectedInTeacherVocab = !!selectedTeacherKey;
   const hasTeacherSavedForWord = (k, rawWord="") => {
-    if (hasAnySavedVocabEntry(unit.vocab || {}, k)) return true;
+    if (hasAnySavedVocabEntry(unit.vocab || {}, k, rawWord)) return true;
     return relatedPhrasesForWord(k, rawWord).some(phraseKey => hasAnySavedVocabEntry(unit.vocab || {}, phraseKey));
   };
   const surfaceWordForKey = key => {
@@ -4131,8 +4506,11 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
 - 동사는 동사원형, 명사는 단수형을 word에 쓴다.
 - pos는 이 문장 속 품사를 noun, verb, adjective, adverb, preposition, conjunction, pronoun, other 중 하나로 쓴다.
 - context_meaning은 이 문장 속 뜻 1개를 자연스러운 한국어로 쓴다.
+- context_meaning과 meanings는 선택한 단어/표현의 짧은 한글 뜻만 쓴다. 문장 전체 해석이나 긴 설명문을 쓰지 않는다.
+- 예: oxygen은 "산소"라고 쓰고 "광합성 과정을 통해 이산화탄소를 산소로 전환시킨다"처럼 문장으로 설명하지 않는다.
 - 대명사, 부사, 전치사, 접속사, 고유한 한 단어는 억지로 줄이지 말고 원래 단어를 그대로 쓴다.
-- especially something, anything, everything, nothing, others, species, offspring, rose, roses, promising, boring, bore, frustrate, frsturate, frusturate, invite, invit, human being, well being, surrounding, surroundings, willing, unwilling, someone, anyone, everyone, thing, during 같은 단어/표현은 문맥에 맞게 둔다.
+- especially added, adding, something, anything, everything, nothing, others, species, offspring, rose, roses, promising, boring, bore, frustrate, frsturate, frusturate, invite, invit, sometimes, human being, well being, surrounding, surroundings, willing, unwilling, someone, anyone, everyone, thing, during 같은 단어/표현은 문맥에 맞게 둔다.
+- added/adding이 "더하다", "추가하다" 뜻의 add 변화형이면 word는 add로 쓰고 ad로 줄이지 않는다.
 - species는 단수형과 복수형이 같은 명사이므로 specie로 바꾸지 않는다.
 - offspring은 단수형과 복수형이 같은 명사이므로 offspr로 줄이지 않는다.
 - rose/roses가 꽃을 뜻하는 명사 문맥이면 word는 rose로 쓰고 rise로 바꾸지 않는다.
@@ -4142,10 +4520,12 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
 - frustrate가 "좌절시키다", "짜증나게 하다", "방해하다" 뜻의 동사이면 pos는 verb로 쓰고 frustrat로 줄이지 않는다.
 - frsturate/frusturate는 철자 오류이면 word를 frustrate로 고치고 pos는 verb로 쓴다.
 - invit는 잘못 잘린 동사 원형이면 word를 invite로 고치고 pos는 verb로 쓴다.
+- sometimes가 "때때로", "가끔" 뜻의 부사이면 word를 sometimes로 쓰고 sometime으로 줄이지 않는다.
 - human being은 두 단어 표현이면 word를 human being으로 쓰고 be로 줄이지 않는다.
 - well being은 두 단어 표현이면 word를 well being으로 쓰고 be로 줄이지 않는다.
 - word는 소문자 영어 표제어 1개만 쓴다.
 - meanings는 한국 학생 중2-고3 수준의 자연스러운 한글 뜻을 최대 4개까지 쓴다.
+- meanings에는 단어 뜻만 넣고 문장 전체 번역이나 긴 설명은 절대 넣지 않는다.
 - syn과 ant는 쉬운 영어를 많이 쓰는 순서로 최대 4개까지, 없으면 빈 배열로 둔다.
 {"words":[{"word":"표제어","pos":"noun","context_meaning":"문맥뜻","meanings":["뜻1"],"syn":["..."],"ant":["..."]}]}`,
         700,
@@ -4183,11 +4563,12 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
   const applyWordEdit = async () => {
     const rawEdit = String(wordEdit || "").trim();
     if (/\s/.test(rawEdit)) { alert("단어 수정은 한 단어만 가능합니다. 표현은 표현 묶기를 사용하세요."); return; }
-    const next = normalizeVocabKey(rawEdit);
+    const next = normalizeTeacherWordForm(rawEdit);
     if (!next) { alert("수정할 단어를 입력하세요."); return; }
     if (next === baseWordFromKey(sel)) return;
     const old = sel;
     const oldLabel = displayVocabKey(old, d || {});
+    setWordReplaceKey(selectedTeacherKey || old);
     setPool(prev => {
       const replaced = prev.map(k=>k===old ? next : k);
       return replaced.includes(next) ? [...new Set(replaced)] : [...replaced, next];
@@ -4205,15 +4586,20 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
       });
       setSavedNotice(`${oldLabel} → ${next} 수정됨 · 뜻을 새로 불러오는 중...`);
       const result = await fetchWord(next, { force:true, surface:next, sentence:sent });
-      if (result?.word && result.word !== next) {
-        setPool(prev => [...new Set(prev.map(k=>k===next ? result.word : k))]);
-        setSel(result.word);
-        setWordEdit(baseWordFromKey(result.word));
+      if (result?.data) {
+        const keptData = normalizeVocabData({
+          ...result.data,
+          base:next,
+          surface:cleanWordToken(surfaceWordForKey(old)) || baseWordFromKey(old),
+          teacherEdited:true
+        });
+        setCache(prev => ({ ...prev, [next]: keptData }));
+        setCachedWord(next, keptData);
       }
       if (result?.data?.ko && !String(result.data.ko).startsWith("(")) {
-        setSavedNotice(`${oldLabel} → ${displayVocabKey(result.word || next, result.data || {})} 수정됨 · 뜻 불러오기 완료`);
+        setSavedNotice(`${oldLabel} → ${displayVocabKey(next, { ...(result.data || {}), base:next })} 수정됨 · 뜻 불러오기 완료`);
       } else {
-        setSavedNotice(`${oldLabel} → ${displayVocabKey(result?.word || next, result?.data || {})} 수정됨 · 뜻을 직접 확인해 주세요`);
+        setSavedNotice(`${oldLabel} → ${displayVocabKey(next, result?.data || {})} 수정됨 · 뜻을 직접 확인해 주세요`);
       }
     } else {
       setSavedNotice(`${oldLabel} → ${displayVocabKey(next, existingNextData)} 수정됨`);
@@ -4221,7 +4607,7 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
   };
   const buildEditedWordData = () => {
     if (!d || d.type === "phrase") return null;
-    const editedBase = normalizeVocabKey(wordEdit || baseWordFromKey(sel));
+    const editedBase = normalizeTeacherWordForm(wordEdit || baseWordFromKey(sel));
     const finalBase = editedBase || baseWordFromKey(sel);
     const contextMeaning = String(vocabDraft.contextMeaning || "").trim();
     const meaningList = parseList(vocabDraft.ko);
@@ -4234,6 +4620,8 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
       ant:parseList(vocabDraft.ant),
       pos:normalizePosForBase(finalBase, vocabDraft.pos || d.pos || posFromKey(sel)),
       base:finalBase,
+      surface:cleanWordToken(surfaceWordForKey(sel)) || baseWordFromKey(sel),
+      teacherEdited:!!wordReplaceKey || finalBase !== baseWordFromKey(sel) || !!d.teacherEdited,
       context:sent,
       contextMeaning:contextMeaning || mergedMeanings[0] || firstMeaning(d)
     });
@@ -4252,15 +4640,17 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
   );
   const saveSelectedVocab = () => {
     if (!canSaveSelected) return;
-    const editedBase = normalizeVocabKey(wordEdit || baseWordFromKey(sel));
+    const editedBase = normalizeTeacherWordForm(wordEdit || baseWordFromKey(sel));
     const saveKey = normalizeStoredVocabKey(editedBase || sel, editedWordData);
-    const ok = onSaveVocab(unit.id, saveKey || sel, editedWordData, selectedTeacherKey);
+    const replaceTarget = wordReplaceKey || selectedTeacherKey;
+    const ok = onSaveVocab(unit.id, saveKey || sel, editedWordData, replaceTarget);
     if (ok) {
       setCache(prev => ({ ...prev, [saveKey || sel]: editedWordData }));
       setCachedWord(saveKey || sel, editedWordData);
       setPool(prev => [...new Set(prev.map(k => k === sel ? (saveKey || sel) : k))]);
       setSel(saveKey || sel);
       setWordEdit(baseWordFromKey(saveKey || sel));
+      setWordReplaceKey("");
     }
     setSavedNotice(ok ? `${displayVocabKey(saveKey || sel, editedWordData)} ${selectedInTeacherVocab ? "수정 저장됨" : "저장됨"}` : "저장 실패");
   };
@@ -4271,23 +4661,46 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
       <p style={{ fontSize:"13px", color:C.muted, marginBottom:"12px" }}>
         {teacherSetupMode
           ? "문장 속 단어를 탭해 교사용 단어장에 저장하고, 필요한 경우 두 단어 이상을 표현으로 묶으세요."
-          : "모르는 단어를 탭 → 단어장에 추가 → 선택하면 뜻·유의어·반의어가 나타납니다"}
+          : !needsCardGame
+            ? "모르는 단어를 탭 → 단어장에 추가 → 선택하면 뜻·유의어·반의어가 나타납니다"
+            : wordGamePhase === "study"
+            ? "문장을 먼저 읽고 모르는 단어를 눌러 뜻을 확인한 뒤 단어 카드 게임을 시작합니다."
+            : "문장별 단어 카드의 뜻을 고르세요."}
       </p>
+      {needsCardGame && !teacherSetupMode && (
+        <div style={{ marginBottom:"14px", padding:"12px", borderRadius:"14px",
+          background:"#fff8e5", border:`1px solid ${C.gold}55`, display:"flex",
+          alignItems:"center", justifyContent:"space-between", gap:"10px", flexWrap:"wrap" }}>
+          <p style={{ margin:0, fontSize:"13px", color:C.ink, fontWeight:800 }}>
+            단어를 이미 알고 있으면 독해 배열만 바로 연습할 수 있습니다.
+          </p>
+          <Btn onClick={skipToReading}>
+            바로 독해 배열로<Icon name="ArrowRight" size={15} color={C.ink}/>
+          </Btn>
+        </div>
+      )}
+      {(!needsCardGame || wordGamePhase === "study") && (
+        <>
       <div style={{ display:"flex", alignItems:"flex-start", gap:"8px", marginBottom:"16px" }}>
         <button onClick={()=>speak(sent,"en-US")} style={{ flexShrink:0, padding:"6px", borderRadius:"999px",
           background:C.coralLight, border:"none", cursor:"pointer", marginTop:"2px" }}>
           <Icon name="Volume2" size={15} color={C.coral}/>
         </button>
-        <p style={{ fontSize:"16px", lineHeight:"1.7", margin:0 }}>
-          {tokens.map((w,i)=>{
-            const k = lookupKey(w,i);
+        <p style={{ fontSize:"16px", lineHeight:"1.7", margin:0, whiteSpace:"pre-wrap" }}>
+          {sentenceParts.map((part,i)=>{
+            if (part.type !== "word") return <span key={`text-${i}`}>{part.text}</span>;
+            const w = part.text;
+            const wordIndex = part.wordIndex;
+            const k = lookupKey(w,wordIndex);
+            const phraseKeys = relatedPhrasesForWord(k, w);
+            const inPhrase = phraseKeys.some(phraseKey => hasAnySavedVocabEntry(unit.vocab || {}, phraseKey));
             const inVocab = hasTeacherSavedForWord(k, w);
             const tokenPoolKeys = keysForToken(unit, k, sent, cache);
-            const inPool = [k, ...tokenPoolKeys].some(item => pool.includes(item));
+            const inPool = [k, ...tokenPoolKeys, ...phraseKeys].some(item => pool.includes(item));
             return (
-              <span key={i} onClick={()=>tapWord(w,i)} style={{ cursor:"pointer", borderRadius:"2px", padding:"0 1px",
-                borderBottom:inVocab?`2px dotted ${C.teal}`:"2px dotted transparent",
-                background:inPool?C.tealLight:"transparent" }}>{w} </span>
+              <span key={`word-${wordIndex}-${i}`} onClick={()=>tapWord(w,wordIndex)} style={{ cursor:"pointer", borderRadius:"2px", padding:"0 1px",
+                borderBottom:inPhrase?`2px dotted ${C.gold}`:inVocab?`2px dotted ${C.teal}`:"2px dotted transparent",
+                background:inPool?(inPhrase?"#fff8e5":C.tealLight):"transparent" }}>{w}</span>
             );
           })}
         </p>
@@ -4324,7 +4737,7 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
               const partKey = baseWordFromKey(k);
               const phraseIndex = phraseParts.indexOf(partKey);
               const isPart = phraseIndex >= 0;
-              const isPhrase = !!(unit.vocab?.[k]?.type === "phrase" || k.includes(" "));
+              const isPhrase = !!(unit.vocab?.[k]?.type === "phrase" || normalizePos(unit.vocab?.[k]?.pos) === "phrase" || k.includes(" "));
               const itemData = getData(k);
               return (
                 <button key={k} onClick={()=>phraseMode ? togglePhrasePart(k) : selPool(k)}
@@ -4335,7 +4748,7 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
                            display:"inline-flex", alignItems:"center", gap:"5px" }}>
                   {isPart && <span style={{ fontSize:"11px", fontWeight:800 }}>{phraseIndex+1}</span>}
                   {displayVocabKey(k, itemData || {})}
-                  {isPhrase && <span style={{ fontSize:"10px", opacity:0.85 }}>표현</span>}
+                  {isPhrase && <span style={{ fontSize:"10px", opacity:0.85 }}>숙어</span>}
                 </button>
               );
             })}
@@ -4349,7 +4762,7 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
           <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
                         gap:"8px", flexWrap:"wrap", marginBottom:"10px" }}>
             <div>
-              <p style={{ margin:0, fontSize:"12px", fontWeight:800, color:C.gold }}>표현 묶기</p>
+              <p style={{ margin:0, fontSize:"12px", fontWeight:800, color:C.gold }}>숙어/표현 묶기</p>
               <p style={{ margin:"2px 0 0", fontSize:"12px", color:C.muted }}>
                 단어 2개 이상을 선택하고 표현과 뜻을 저장하세요.
               </p>
@@ -4454,7 +4867,7 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
                 style={{ display:"inline-flex", alignItems:"center", gap:"6px", padding:"7px 12px",
                   borderRadius:"999px", background:"#fff", color:C.gold, border:`1px solid ${C.gold}88`,
                   cursor:"pointer", fontSize:"12px", fontWeight:700, flexShrink:0 }}>
-                표현 수정
+                숙어 수정
               </button>
             )}
             {canSaveSelected && (
@@ -4530,7 +4943,21 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
         </div>
       )}
 
-      {needsCardGame && (
+      {needsCardGame && wordGamePhase === "study" && (
+        <div style={{ borderRadius:"16px", padding:"14px", marginBottom:"16px",
+          background:"#f0fdfa", border:`1px solid ${C.teal}33` }}>
+          <p style={{ margin:"0 0 10px", fontSize:"13px", color:C.ink, fontWeight:800 }}>
+            이 문장의 단어를 충분히 확인했으면 카드 게임을 시작하세요.
+          </p>
+          <Btn primary onClick={startCardGame}>
+            단어 카드 시작<Icon name="ArrowRight" size={15} color="#fff"/>
+          </Btn>
+        </div>
+      )}
+        </>
+      )}
+
+      {needsCardGame && wordGamePhase === "quiz" && (
         <div style={{ borderRadius:"16px", padding:"14px", marginBottom:"16px",
           background:"#fff8e5", border:`1px solid ${C.gold}55` }}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center",
@@ -4541,9 +4968,16 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
                 문장마다 최대 4개 단어의 뜻을 확인합니다.
               </p>
             </div>
-            <span style={{ fontSize:"12px", color:C.gold, fontWeight:800 }}>
-              {cardQueue.length ? `${cardIndex+1}/${cardQueue.length}` : "출제 단어 없음"}
-            </span>
+            <div style={{ display:"flex", alignItems:"center", gap:"8px", flexWrap:"wrap" }}>
+              <button onClick={()=>setWordGamePhase("study")}
+                style={{ padding:"6px 10px", borderRadius:"999px", border:`1px solid ${C.gold}88`,
+                  background:"#fff", color:C.gold, fontSize:"12px", fontWeight:800, cursor:"pointer" }}>
+                문장 다시 보기
+              </button>
+              <span style={{ fontSize:"12px", color:C.gold, fontWeight:800 }}>
+                {cardQueue.length ? `${cardIndex+1}/${cardQueue.length}` : "출제 단어 없음"}
+              </span>
+            </div>
           </div>
           {!cardQueue.length ? (
             <p style={{ margin:0, fontSize:"13px", color:C.muted }}>
@@ -4595,7 +5029,12 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
         <Btn onClick={teacherSetupMode ? prevSentence : onPrev} disabled={teacherSetupMode && si===0}>
           {teacherSetupMode ? "이전 문장" : "이전"}
         </Btn>
-        <Btn primary onClick={next} disabled={needsCardGame && !sentenceCardDone}>
+        {needsCardGame && !teacherSetupMode && (
+          <Btn onClick={skipToReading}>
+            바로 독해 배열로<Icon name="ArrowRight" size={15} color={C.ink}/>
+          </Btn>
+        )}
+        <Btn primary onClick={next} disabled={needsCardGame && (wordGamePhase !== "quiz" || !sentenceCardDone)}>
           {si<unit.englishSentences.length-1
             ? <>다음 문장<Icon name="ArrowRight" size={15} color="#fff"/></>
             : teacherSetupMode
@@ -4608,17 +5047,25 @@ function GameStep3({ unit, speak, onPrev, onNext, apiKey, onChangeKey, allowAiLo
 }
 
 /* ── Step 4 ── */
-function GameStep4({ unit, speak, onPrev, onRestart, assignment=null, startedAt=null, wordGameSummary=null, onAssignmentComplete=null }) {
-  const [si, setSi]         = useState(0);
-  const [arranged, setArr]  = useState([]);
-  const [bank, setBank]     = useState(()=>shuffleArr(unit.koreanChunks[0]||[]));
-  const [status, setStatus] = useState(null);
-  const [results, setResults] = useState([]);
-  const [checkedThisSentence, setCheckedThisSentence] = useState(false);
-  const [done, setDone]     = useState(false);
+function GameStep4({ unit, speak, onPrev, onRestart, assignment=null, startedAt=null, wordGameSummary=null, initialState=null, onProgressChange=null, onAssignmentComplete=null }) {
+  const sentenceCount = unit.koreanChunks.length || 1;
+  const initialSi = Math.min(sentenceCount - 1, Math.max(0, Number(initialState?.si) || 0));
+  const initialArranged = Array.isArray(initialState?.arranged) ? initialState.arranged : [];
+  const initialBank = Array.isArray(initialState?.bank) ? initialState.bank : [];
+  const [si, setSi]         = useState(initialSi);
+  const [arranged, setArr]  = useState(initialArranged);
+  const [bank, setBank]     = useState(()=>initialBank.length || initialArranged.length ? initialBank : shuffleArr(unit.koreanChunks[initialSi]||[]));
+  const [status, setStatus] = useState(initialState?.status || null);
+  const [results, setResults] = useState(()=>Array.isArray(initialState?.results) ? initialState.results : []);
+  const [checkedThisSentence, setCheckedThisSentence] = useState(!!initialState?.checkedThisSentence);
+  const [done, setDone]     = useState(!!initialState?.done);
   const [saveStatus, setSaveStatus] = useState("");
   const savedRef = useRef(false);
   const answer = unit.koreanChunks[si]||[];
+
+  useEffect(() => {
+    onProgressChange?.({ si, arranged, bank, status, results, checkedThisSentence, done });
+  }, [si, JSON.stringify(arranged), JSON.stringify(bank), status, JSON.stringify(results), checkedThisSentence, done]);
 
   const pick = (c,i) => { if(status==="correct") return; setArr(a=>[...a,c]); setBank(b=>b.filter((_,j)=>j!==i)); setStatus(null); };
   const undo = () => {
